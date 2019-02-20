@@ -1,0 +1,709 @@
+void FASTmergeRWSLB_CONT_DLST_VTLMA(sim *simPtr) {//參數控制的DELAY LEFT, DELAY PERIOD可調整
+	DWORD	dataBlock, Victim;// = simPtr->NFTLobj.firstRWblock, rDataBlk = 0, validPages = 0, invalidPages = 0, ret;
+	NFTL *N = &(simPtr->NFTLobj); NFTLconfig *NC = &(simPtr->NFTLobj.configObj);
+	NFTL_SLB *SLB = &((simPtr->NFTLobj).SLB); NFTL_NSLB *NSLB = &((simPtr->NFTLobj).NSLB);
+	DWORD	mergedDBstart = 0, mergedDBend = 0;
+	I64	SectorTableNo1 = 0, SectorTableNo2 = 0, SectorTableNo3 = 0;
+	DWORD	i = 0, j = 0, k = 0;
+
+	DWORD validIs0 = 0, validIs1 = 0;
+	DWORD block_no = 0, section_no = 0;
+#ifdef Time_Overhead
+	DWORD merge_ram_size = 0;
+	DWORD *merge_ram = (DWORD*)calloc(NC->blockSizeSection, sizeof(DWORD));
+	DWORD NoMerge_Band = 0;
+	DWORD Merge_R_SeekCount = 0, Merge_W_SeekCount = 0;
+#endif
+	//紀錄每次有效merge帶走多少band,多少dirty sectors,多少cumu dirty sectors
+	DWORD Merge_Bands = 0;
+	I64 Dirty_Sectors = 0, Cumu_Dirty_Sectors = 0;
+	//SLB統計PM會merge到那些Cylinder上
+	DWORD s_DirtyCyl = 0, e_DirtyCyl = 0;
+	DWORD *DB_Cylinder = (DWORD*)calloc(NC->blockSizeTrack, sizeof(DWORD));
+	DWORD dataSector;
+	DWORD LBsector;
+	//Delay clean region統計
+	DWORD DELAY_CleanRegionMAx = 0;//MAX
+	DWORD DELAY_CleanRegion_StartCyl = 0, DELAY_CleanRegion_EndCyl = 0;
+	DWORD DELAY_CleanRegionTmp = 0;//tmp
+	DWORD DELAY_CleanRegion_StartCylTmp = 0;
+
+	//Track Unit轉成Cylinder Unit, 用Cylinder判斷能不能Delay
+	DWORD *Cylinder_DirtyUnit = (DWORD*)calloc(NC->blockSizeCylinder, sizeof(DWORD));
+
+	SLB->mergecnt++;
+	Victim = NC->PsizeBlock - 1;
+	//tsp is "trackSizePage"
+	//修改
+	const DWORD tsp_start = SLB->firstRWsection;
+	const DWORD tsp_end = (SLB->firstRWsection + NC->trackSizeSection - 1) % (SLB->Partial_Section + 1); //(SLB->firstRWsection + NC->CylinderSizeSector - 1) % (SLB->Partial_Section + 1);
+	assert(NC->CylinderSizeTrack*NC->trackSizeSection == NC->CylinderSizeSector);//4096
+	assert(NC->trackSizeSection == 1024);
+
+	//新增
+	const DWORD MA = Limited_MergeAssociativity;// 1;
+	DWORD *LPB_BUFF = (DWORD*)calloc(NC->trackSizeSector, sizeof(DWORD));//LoopBand
+	DWORD LPB_BUFF_Len = 0;
+	//紀錄Delay+LoopBand共有多少寫回
+	N->WB_BUFF_Len = 0;
+
+#ifdef Simulation_SLB_DELAY
+	N->VC_BUFF_Len = 0;//暫存Delay Sector
+#endif
+	assert(tsp_start <= tsp_end); assert(NC->blockSizeSector == NC->blockSizeSection);
+	for (i = tsp_start; i <= tsp_end; i++){	//SLB的victim track做merge
+		SectorTableNo1 = N->blocks[Victim].sections[i].sector; assert(0 <= SectorTableNo1 && SectorTableNo1 < NC->LsizePage);
+		if (!(tsp_start <= i && i <= tsp_end)){ printf("%lu %lu %lu\n", tsp_start, i, tsp_end); system("pause"); }
+		//有一張P2L的SLB section mapping table，協助搜尋SLB裡存放的victim band的dirty section
+		
+		if (N->blocks[Victim].sections[i].valid == 3){}//遇到Delay Sector, 等Victim Merge結束再寫回新LastRW
+		else if (N->blocks[Victim].sections[i].valid == 1){ //一般Dirty Sector, 做Band Merge
+			assert((N->blocks[Victim].sections[i].sector) < NC->LsizePage);
+			dataBlock = N->blocks[Victim].sections[i].sector / NC->blockSizeSector;
+			dataSector = N->blocks[Victim].sections[i].sector % NC->blockSizeSector;
+			assert(N->DBalloc[dataBlock] == 1);
+			assert(N->blocks[dataBlock].sections != NULL);
+			assert(N->blocks[dataBlock].sections[dataSector].valid == 0);
+			assert(0 <= dataBlock && dataBlock < NC->LsizeBlock);
+
+			//新增
+			if (Merge_Bands > MA){
+				assert(N->blocks[dataBlock].sections[dataSector].sector == i);
+				N->blocks[Victim].sections[i].valid = 0;
+				N->blocks[dataBlock].sections[dataSector].valid = 1;
+				N->blocks[dataBlock].sections[dataSector].sector = dataBlock*NC->blockSizeSector + dataSector;
+				assert(LPB_BUFF_Len < NC->trackSizeSector);
+				LPB_BUFF[LPB_BUFF_Len] = dataBlock*NC->blockSizeSector + dataSector; LPB_BUFF_Len++;
+				continue;
+			}
+
+#ifdef Time_Overhead
+			N->Merge_Bandcount++;
+			merge_ram_size = 0;
+#endif
+			//紀錄每次有效merge帶走多少band
+			Merge_Bands++;
+			validIs0 = 0; validIs1 = 0;
+			DWORD start_Sector = 0, start_Track = 0, start_Cylinder = 0;
+			DWORD DELAY_SIG = 0;
+#ifdef Simulation_SLB_DELAY
+			DWORD DelaySector = 0; DWORD preDelaySector = 0;//檢查舊Delay Sector
+			const DWORD DirtyUnit_TD = N->DirtyUnit_TD, SaveCylinder_TD = N->SaveCylinder_TD;//
+
+			//Track Unit轉成Cylinder Unit
+			for (j = 0; j < NC->blockSizeCylinder; j++){ Cylinder_DirtyUnit[j] = 0; }
+			for (j = 0; j < NC->blockSizeTrack; j++){
+				assert(j / NC->CylinderSizeTrack < NC->blockSizeCylinder);
+				Cylinder_DirtyUnit[j / NC->CylinderSizeTrack] += N->SHUFFLE_TL[dataBlock].DirtyUnit[j];
+			}
+
+			//限定Band Merge含第二次以上才可以Delay
+			if (N->PMstatistic_DB[dataBlock] >= 1 && N->DELAY_SECTORinBAND[dataBlock] > 0){//上次Merge有做過Delay
+				if (N->BAND_DELAY_PERIOD[dataBlock] < N->DELAY_PERIOD){//還在允許的Delay次數內
+					//檢查舊Delay Sector有確實留在SLB裡
+					for (j = 0; j < NC->blockSizeSector; j++){
+						if (N->blocks[dataBlock].sections[j].valid == 0 && N->blocks[Victim].sections[N->blocks[dataBlock].sections[j].sector].valid == 3){ preDelaySector++; }
+					}assert(preDelaySector == N->DELAY_SECTORinBAND[dataBlock]);
+					//確認SHUFFLE_BOUND的範圍正確
+					assert(0 < N->SHUFFLE_BOUND[dataBlock]); assert(N->SHUFFLE_BOUND[dataBlock] < NC->blockSizeCylinder);
+					assert(N->DELAY_SECTORinBAND[dataBlock] <= N->SLB_DELAY_USE);
+					//計算繼續Delay總共會有多少Sector: 在DELAY_SECTORinBAND以左的Sector一定比原本DELAY_SECTORinBAND多
+					for (j = 0; j < N->SHUFFLE_BOUND[dataBlock]; j++){
+						//assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[j] >= 0);
+						//DelaySector += N->SHUFFLE_TL[dataBlock].DirtyUnit[j];
+						assert(Cylinder_DirtyUnit[j] >= 0);
+						DelaySector += Cylinder_DirtyUnit[j];
+					}assert(DelaySector >= N->DELAY_SECTORinBAND[dataBlock]);
+					if (N->SLB_DELAY_USE + DelaySector - N->DELAY_SECTORinBAND[dataBlock] <= N->SLB_DELAY_SPACE && DelaySector <= DirtyUnit_TD){
+						DELAY_SIG = 3; //成功繼續Delay
+						//更新Delay Info: SLB裡Delay的Sector增加
+						N->SLB_DELAY_USE += (DelaySector - N->DELAY_SECTORinBAND[dataBlock]);
+						N->CumuSLB_DELAY_USE += N->SLB_DELAY_USE;
+						N->DELAY_SECTORinBAND[dataBlock] = DelaySector; assert(N->SHUFFLE_BOUND[dataBlock] != 0);
+						//找繼續Delay Band上的當前start_Cylinder
+						j = N->SHUFFLE_BOUND[dataBlock]; 
+						//while (N->SHUFFLE_TL[dataBlock].DirtyUnit[j] == 0){ j++; if (j == NC->blockSizeCylinder){ break; } }
+						while (Cylinder_DirtyUnit[j] == 0){ j++; if (j == NC->blockSizeCylinder){ break; } }
+						assert(j <= NC->blockSizeCylinder);
+						start_Cylinder = j;
+						start_Track = start_Cylinder*NC->CylinderSizeTrack;
+						start_Sector = start_Cylinder*NC->CylinderSizeSector;
+						//有再次Delay成功 
+						assert(N->BAND_DELAY_PERIOD[dataBlock] > 0);
+						N->BAND_DELAY_PERIOD[dataBlock]++; 
+					}
+				}
+			}else if (N->PMstatistic_DB[dataBlock] >= 1 && N->DELAY_SECTORinBAND[dataBlock] == 0){//沒有做過Delay  
+				//找出DB上第一條有髒資料的P Address Cylinder
+				assert(N->SHUFFLE_TL_Alloc[dataBlock] == 1);
+				j = 0; //while (N->SHUFFLE_TL[dataBlock].DirtyUnit[j] == 0){ j++; }
+				while (Cylinder_DirtyUnit[j] == 0){ j++; } assert(j < NC->blockSizeCylinder); 
+				//assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[j] > 0);
+				assert(Cylinder_DirtyUnit[j] > 0);
+				start_Cylinder = j;
+				//找出Max CR
+				DELAY_CleanRegionMAx = 0;//這裡修改, 改從Dirty Range找最右MaxCR// start_Cylinder + 1; //紀錄初始最左Max CR的大小
+				DELAY_CleanRegion_StartCyl = 0; DELAY_CleanRegion_EndCyl = start_Cylinder;//紀錄初始最左Max CR的起點, 終點 //DELAY_CleanRegion_EndCyl沒在用
+				//tmp 紀錄目前算到的CR
+				DELAY_CleanRegionTmp = 0;//從Band剩下的CR裡面找出Max CR
+				DELAY_CleanRegion_StartCylTmp = 0; //用不到 DELAY_CleanRegion_EndCylTmp = 0;
+				//開始找start_Cylinder以右最大的CR
+				for (j = start_Cylinder; j < NC->blockSizeCylinder; j++){
+					//assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[j] >= 0);
+					assert(Cylinder_DirtyUnit[j] >= 0);
+					if (Cylinder_DirtyUnit[j] == 0 && j + 1 < NC->blockSizeCylinder){//最右邊01有處理,但是00沒處理  N->SHUFFLE_TL[dataBlock].DirtyUnit[j] == 0
+						//保證Dirty_j是0
+						//assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[j + 1] >= 0);
+						assert(Cylinder_DirtyUnit[j + 1] >= 0);
+						for (k = 0; k < NC->CylinderSizeTrack; k++){ assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[j*NC->CylinderSizeTrack + k] == 0); }
+						if (Cylinder_DirtyUnit[j + 1] == 0){ //累積連續CR空間  N->SHUFFLE_TL[dataBlock].DirtyUnit[j + 1] == 0
+							for (k = 0; k < NC->CylinderSizeTrack; k++){ assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[(j+1)*NC->CylinderSizeTrack + k] == 0); }
+							DELAY_CleanRegionTmp++;
+							if (DELAY_CleanRegionTmp == 1){ DELAY_CleanRegion_StartCylTmp = j; }
+						}else{//Dirty_j+1是>0
+							BYTE DIRTY = 0; for (k = 0; k < NC->CylinderSizeTrack; k++){ if (N->SHUFFLE_TL[dataBlock].DirtyUnit[(j+1)*NC->CylinderSizeTrack + k] > 0){ DIRTY = 1; } }
+							assert(DIRTY == 1);
+							if (DELAY_CleanRegionTmp >= DELAY_CleanRegionMAx){
+								DELAY_CleanRegionMAx = DELAY_CleanRegionTmp;
+								DELAY_CleanRegion_StartCyl = DELAY_CleanRegion_StartCylTmp;
+								DELAY_CleanRegion_EndCyl = j;
+							}
+							DELAY_CleanRegionTmp = 0;//找到,統計完歸0 
+						}
+					}
+				}//處理尾段是00
+				/*if (DELAY_CleanRegionTmp >= DELAY_CleanRegionMAx){
+				DELAY_CleanRegionMAx = DELAY_CleanRegionTmp;
+				DELAY_CleanRegion_StartCyl = DELAY_CleanRegion_StartCylTmp;
+				DELAY_CleanRegion_EndCyl = NC->blockSizeCylinder - 1;
+				}*/
+				assert(DELAY_CleanRegion_StartCyl <= DELAY_CleanRegion_EndCyl);
+				assert(DELAY_CleanRegion_EndCyl < NC->blockSizeCylinder);
+				//確保最大CR不是在最左邊, 才有Delay價值
+				DelaySector = 0;
+				DWORD L_Index, LSN;//邏輯位址, LSN: L_SectorNo
+				if (DELAY_CleanRegion_StartCyl != 0){
+					assert(start_Cylinder < DELAY_CleanRegion_StartCyl);
+					//Delay統計預先跑一次, 真的要做再跑流程
+					//換到邏輯位址計算Delay和一般sector的量, 確認Max CR上沒有髒
+					start_Track = start_Cylinder * NC->CylinderSizeTrack; 
+					assert(start_Track < NC->blockSizeTrack);
+					for (j = start_Track; j < NC->blockSizeTrack; j++){
+						L_Index = N->SHUFFLE_TL[dataBlock].P2L_Index[j];//P2L, Logical Cylinder No
+						for (k = 0; k < NC->trackSizeSector; k++){
+							LSN = L_Index*NC->trackSizeSector + k;
+							if (start_Cylinder <= j / NC->CylinderSizeTrack && j / NC->CylinderSizeTrack < DELAY_CleanRegion_StartCyl){
+								assert(N->blocks[dataBlock].sections[LSN].valid == 0 || N->blocks[dataBlock].sections[LSN].valid == 1);
+								if (N->blocks[dataBlock].sections[LSN].valid == 0){ DelaySector++; }//可能會Delay的段落: 算出需要Delay多少Sector
+							}else if (DELAY_CleanRegion_StartCyl <= j / NC->CylinderSizeTrack && j / NC->CylinderSizeTrack < DELAY_CleanRegion_EndCyl){
+								assert(N->blocks[dataBlock].sections[LSN].valid == 1);//確定Max CR裡真的沒東西
+							}else{} //要Shuffle的段落
+						}
+					}
+					//以下三條件都符合就確定Delay
+					if (DelaySector <= DirtyUnit_TD){ DELAY_SIG++; }//Max CR以左的Dirty Sector <= Dirty門檻
+					assert(N->SLB_DELAY_USE >= N->DELAY_SECTORinBAND[dataBlock]);
+					if (N->SLB_DELAY_USE + DelaySector <= N->SLB_DELAY_SPACE){ DELAY_SIG++; }//SLB Delay Space還有空間// - N->DELAY_SECTORinBAND[dataBlock]
+					assert(start_Cylinder < DELAY_CleanRegion_EndCyl);
+					if (DELAY_CleanRegion_EndCyl + 1 - start_Cylinder >= SaveCylinder_TD){ DELAY_SIG++; }//Delay省的Merge寫入 >= Save Region門檻
+				}
+				if (DELAY_SIG == 3){
+					//第一次Delay 初始化
+					//start_Cylinder移到DELAY_CleanRegion_EndCyl後
+					//Delay Sector留SLB, start_Cylinder做Shuffle Merge
+					start_Cylinder = DELAY_CleanRegion_EndCyl + 1; assert(start_Cylinder < NC->blockSizeCylinder);
+					start_Track = start_Cylinder*NC->CylinderSizeTrack;
+					start_Sector = start_Cylinder*NC->CylinderSizeSector;
+					//assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[DELAY_CleanRegion_EndCyl] == 0);
+					//assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[DELAY_CleanRegion_EndCyl + 1] > 0);
+					//assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[start_Cylinder] > 0);
+					assert(Cylinder_DirtyUnit[DELAY_CleanRegion_EndCyl] == 0);
+					for (j = 1; j <= NC->CylinderSizeTrack; j++){ assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[start_Track - j] == 0); }
+					assert(Cylinder_DirtyUnit[DELAY_CleanRegion_EndCyl + 1] > 0);
+					assert(Cylinder_DirtyUnit[start_Cylinder] > 0);
+					BYTE DIRTY = 0; for (j = 0; j < NC->CylinderSizeTrack; j++){ if (N->SHUFFLE_TL[dataBlock].DirtyUnit[start_Track + j] > 0){ DIRTY = 1; } }
+					assert(DIRTY == 1);
+					//確認是第一次Delay
+					assert(N->DELAY_SECTORinBAND[dataBlock] == 0);
+					assert(DelaySector > 0);
+					//更新Delay Info: SLB裡Delay的Sector增加
+					N->SLB_DELAY_USE += DelaySector;
+					N->CumuSLB_DELAY_USE += N->SLB_DELAY_USE;
+					N->DELAY_SECTORinBAND[dataBlock] = DelaySector;
+					N->SHUFFLE_BOUND[dataBlock] = start_Cylinder; assert(N->SHUFFLE_BOUND[dataBlock] != 0);
+					//有Delay成功 
+					assert(N->BAND_DELAY_PERIOD[dataBlock] == 0);
+					N->BAND_DELAY_PERIOD[dataBlock]++;
+				}
+			}
+			//Delay失敗
+			if (DELAY_SIG != 3){
+				assert(DELAY_SIG < 3); //如果曾經Delay, 歸還SLB Delay Space
+				//歸還: 加總後扣給SLB_DELAY_USE
+				if (N->DELAY_SECTORinBAND[dataBlock] > 0){
+					assert(N->SLB_DELAY_USE >= N->DELAY_SECTORinBAND[dataBlock]);
+					assert(N->SHUFFLE_BOUND[dataBlock] != 0);
+					//更新Delay Info: SLB裡Delay的Sector增加
+					N->SLB_DELAY_USE -= N->DELAY_SECTORinBAND[dataBlock];
+					N->CumuSLB_DELAY_USE += N->SLB_DELAY_USE;
+					N->DELAY_SECTORinBAND[dataBlock] = 0;
+					N->SHUFFLE_BOUND[dataBlock] = 0;
+					//確認之前Delay過
+					assert(N->BAND_DELAY_PERIOD[dataBlock] > 0);
+					N->BAND_DELAY_PERIOD[dataBlock] = 0;
+				}
+			}
+			//統計SLB Live Rate
+			if (DELAY_SIG == 3){ N->DELAY_cnt++; }
+			N->SLB_USE = N->l2pmapOvd.AA;
+			N->CumuSLB_USE += N->SLB_USE;
+#endif
+			//SLB統計PM會merge到那些Cylinder上
+			for (j = 0; j < NC->blockSizeTrack; j++){ DB_Cylinder[j] = 0; }
+			N->PMstatistic_DB[dataBlock]++;
+			for (j = 0; j < NC->blockSizeSector; j++){//SHUFFLE做過後邏輯位址第一個的start_Sector會不能用
+				SectorTableNo2 = (I64)dataBlock*NC->blockSizeSector + j; assert(0 <= SectorTableNo2 && SectorTableNo2 < NC->LsizePage);
+				block_no = dataBlock; section_no = j;
+				if (N->blocks[dataBlock].sections[j].valid == 1){ //原本就在data block裡的valid page
+					assert(0 <= block_no && block_no < NC->LsizeBlock); assert(0 <= section_no && section_no < NC->blockSizeSection);
+					//printf("%I64u   %I64u\n", N->blocks[dataBlock].sections[j].sector, SectorTableNo2);
+					//assert(N->blocks[dataBlock].sections[j] != NULL);
+					assert(N->blocks[dataBlock].sections[j].sector == SectorTableNo2);
+				}else if (N->blocks[dataBlock].sections[j].valid == 0){ //invalid在LB的該page
+					LBsector = N->blocks[dataBlock].sections[j].sector;
+					assert(0 <= LBsector); assert(LBsector <= SLB->Partial_Section);
+					assert(N->blocks[NC->LsizeBlock].sections[LBsector].valid == 1 || N->blocks[NC->LsizeBlock].sections[LBsector].valid == 3);
+					
+					assert(N->blocks[NC->LsizeBlock].sections[LBsector].sector == SectorTableNo2);
+					//SLB統計PM會merge到那些Cylinder上
+					assert(j / NC->trackSizeSector < NC->blockSizeTrack);
+					DB_Cylinder[j / NC->trackSizeSector]++;//L_Address //N->SHUFFLE_TL[dataBlock].L2P_Index[j / NC->CylinderSizeSector]
+					//更新統計資料
+					validIs0 += NC->Section;
+#ifdef Simulation_SLB_DELAY
+					//N->SHUFFLE_TL[dataBlock].L2P_Index[j / NC->CylinderSizeSector];
+					DWORD P_Index = N->SHUFFLE_TL[dataBlock].L2P_Index[j / NC->trackSizeSector];
+					assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[P_Index] > 0);
+					//SHuffle過P_Index < N->SHUFFLE_BOUND[dataBlock] 不保證是Delay Sector
+					if (DELAY_SIG == 3 && P_Index / NC->CylinderSizeTrack < N->SHUFFLE_BOUND[dataBlock]){// DELAY_CleanRegion_StartCyl
+						//assert(N->blocks[NC->LsizeBlock].sections[LBsector].valid == 1);
+						if (tsp_start <= LBsector && LBsector <= tsp_end){//Victim Cylinder上免費還
+							//歸還SLB
+							N->blocks[NC->LsizeBlock].sections[LBsector].valid = 0;
+							//假寫回Band, 等Merge結束繞寫回lastRW
+							N->blocks[dataBlock].sections[j].sector = SectorTableNo2;
+							N->blocks[dataBlock].sections[j].valid = 1;
+							//Victim Cylinder上的Band Drity Sector暫存VictimCylinder_BUFF, 等全部Merge結束WB
+							//暫存等Merge結束寫到lastRW
+							//assert(N->VC_BUFF_Len < NC->CylinderSizeSector);
+							assert(N->VC_BUFF_Len < NC->trackSizeSector);
+							N->VictimCylinder_BUFF[N->VC_BUFF_Len] = SectorTableNo2; N->VC_BUFF_Len++;
+							//Delay Band的SHUFFLE_TL不歸0,累積更新
+						}else{ //標為Delay Sector
+							N->blocks[NC->LsizeBlock].sections[LBsector].valid = 3;
+						}//不在Victim Cylinder上, 暫不處理
+					}else{
+#endif
+#ifdef Time_Overhead
+						merge_ram[merge_ram_size] = LBsector; merge_ram_size++; assert(merge_ram_size <= NC->blockSizeSection);
+#endif
+#ifdef SLB_Mapping_Cache
+#ifdef CFLRU
+						BYTE EntrySizeBit = 57;
+						DWORD LookaheadEntry = NC->sectorSizeByte * 8 / EntrySizeBit;
+						BYTE write = 0;
+						I64 dropEntSecStart = SectorTableNo2 / LookaheadEntry *LookaheadEntry;
+						DWORD drop_block, drop_sec, drop_same_block, drop_same_sec;
+						drop_block = SectorTableNo2 / NC->blockSizeSector;
+						drop_sec = SectorTableNo2 % NC->blockSizeSector;
+						if (N->blocks[drop_block].sections[drop_sec].cache_stat == 1){
+							N->Cache_Merge_withW++;
+							for (BYTE offset = 0; offset < LookaheadEntry; offset++){ // clean the same sector's entry data
+								drop_same_block = (DWORD)(dropEntSecStart + offset) / NC->blockSizeSector;
+								drop_same_sec = (DWORD)(dropEntSecStart + offset) % NC->blockSizeSector;
+								assert(N->DBalloc[drop_same_block] == 1);
+								if (N->blocks[drop_same_block].sections[drop_same_sec].inCache != NULL && N->blocks[drop_same_block].sections[drop_same_sec].cache_stat == 1){ //clean the bit for those who are still in the cache
+									N->blocks[drop_same_block].sections[drop_same_sec].cache_stat = 0;
+								}
+							}
+						}
+#endif			
+						CacheDrop(simPtr, SectorTableNo2);
+#endif
+						assert((DELAY_SIG == 3 && P_Index / NC->CylinderSizeTrack >= N->SHUFFLE_BOUND[dataBlock]) || DELAY_SIG < 3);
+						N->blocks[NC->LsizeBlock].sections[LBsector].valid = 0;//invalid old
+						N->blocks[dataBlock].sections[j].sector = SectorTableNo2;
+						N->blocks[dataBlock].sections[j].valid = 1;
+
+					}
+				}else{ printf("SLB merge error\n"); system("pause"); }
+			}
+
+#ifdef Simulation_SLB_SHUFFLE
+			//找出DB上最左第一個CR, 得出需要merge的cylinder數
+			//Shuffle: Cylinder依照freq, dirty, L_Address排序. 若相同就看下一個條件, 最後一定在L_Address分出勝負
+			DWORD SHUFFLE_TL_SWAP_SIG;
+			DWORD tmp_WriteFreq, tmp_DirtyUnit;
+			DWORD Lj, Pj, Lk, Pk;
+			DWORD tmp_MaxIndex;
+
+			if (DELAY_SIG != 3){//Delay失敗, 找Shuffle範圍
+				assert(N->SHUFFLE_TL_Alloc[dataBlock] == 1);
+				j = 0;//找出DB上第一條有髒資料的P address Cylinder
+				while (N->SHUFFLE_TL[dataBlock].DirtyUnit[j] == 0){ j++; }//SHUFFLE_TL[dataBlock].DirtyUnit找出第一條髒cylinder
+				assert(j <= NC->blockSizeTrack - 1); assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[j] > 0);
+				//初始化start_Sector, start_Track, start_Cylinder, 提供之後算時間
+				start_Cylinder = j / NC->CylinderSizeTrack; //找出第一條髒cylinder上的第一條髒track和髒sector
+				start_Track = j;
+				start_Sector = j * NC->trackSizeSector;
+				for (j = 0; j < start_Track; j++){
+					assert(N->SHUFFLE_TL[dataBlock].WriteFreq[j] == 0);
+					assert(N->SHUFFLE_TL[dataBlock].DirtyUnit[j] == 0);
+				}
+			}
+
+			//剛剛已排除DB前段CR(clean region), 開始Shuffle整個DB, Cylinder依照優先權排順序
+			for (j = NC->blockSizeTrack - 1; j >= start_Track; j--){//j, k 都是P裡的位置
+				tmp_MaxIndex = j;
+				for (k = start_Track; k < j; k++){//不可以讓j, k < 0, DWORD沒有負數
+					SHUFFLE_TL_SWAP_SIG = 0;//初始化, 1表示要交換Cylinder 
+					assert(0 <= tmp_MaxIndex); assert(tmp_MaxIndex < NC->blockSizeTrack);
+					assert(0 <= k); assert(k < NC->blockSizeTrack);
+					if (N->SHUFFLE_TL[dataBlock].WriteFreq[tmp_MaxIndex] < N->SHUFFLE_TL[dataBlock].WriteFreq[k]){ SHUFFLE_TL_SWAP_SIG = 1; }
+					else if ((N->SHUFFLE_TL[dataBlock].WriteFreq[tmp_MaxIndex] == N->SHUFFLE_TL[dataBlock].WriteFreq[k]) && (N->SHUFFLE_TL[dataBlock].DirtyUnit[tmp_MaxIndex] < N->SHUFFLE_TL[dataBlock].DirtyUnit[k])){ SHUFFLE_TL_SWAP_SIG = 1; }
+					//else if ((N->SHUFFLE_TL[dataBlock].WriteFreq[tmp_MaxIndex] == N->SHUFFLE_TL[dataBlock].WriteFreq[k]) && (N->SHUFFLE_TL[dataBlock].DirtyUnit[tmp_MaxIndex] == N->SHUFFLE_TL[dataBlock].DirtyUnit[k]) && (N->SHUFFLE_TL[dataBlock].P2L_Index[tmp_MaxIndex] < N->SHUFFLE_TL[dataBlock].P2L_Index[k])){ SHUFFLE_TL_SWAP_SIG = 1; }
+					//不能讓都沒寫過的因為LA比較大就把曾經寫過但這次沒寫的擠下去
+
+					if (SHUFFLE_TL_SWAP_SIG == 1){ tmp_MaxIndex = k; }
+				}
+				if (tmp_MaxIndex != j){
+					//k是tmp_MaxIndex, k不斷和k+1交換, 最後j-1和j換完把tmp_Max放到j位置上
+					assert(0 <= tmp_MaxIndex); assert(tmp_MaxIndex < j);
+					for (k = tmp_MaxIndex; k < j; k++){
+						//初始化:Lj, Pj -> 裝資料A. Lk, Pk -> 裝資料B
+						Pj = k + 1; Lj = N->SHUFFLE_TL[dataBlock].P2L_Index[Pj]; assert(Lj < NC->blockSizeTrack);
+						Pk = k; Lk = N->SHUFFLE_TL[dataBlock].P2L_Index[Pk]; assert(Lk < NC->blockSizeTrack);
+						//備份K位置上的資料
+						tmp_WriteFreq = N->SHUFFLE_TL[dataBlock].WriteFreq[Pk]; tmp_DirtyUnit = N->SHUFFLE_TL[dataBlock].DirtyUnit[Pk];
+						assert(Pk == N->SHUFFLE_TL[dataBlock].L2P_Index[Lk]); assert(Lk == N->SHUFFLE_TL[dataBlock].P2L_Index[Pk]);
+						//j給k, Pk->Lj, B->A
+						N->SHUFFLE_TL[dataBlock].P2L_Index[Pk] = Lj;
+						N->SHUFFLE_TL[dataBlock].WriteFreq[Pk] = N->SHUFFLE_TL[dataBlock].WriteFreq[Pj];
+						N->SHUFFLE_TL[dataBlock].DirtyUnit[Pk] = N->SHUFFLE_TL[dataBlock].DirtyUnit[Pj];
+						assert(Pj == N->SHUFFLE_TL[dataBlock].L2P_Index[Lj]); assert(Lj == N->SHUFFLE_TL[dataBlock].P2L_Index[Pj]);
+						N->SHUFFLE_TL[dataBlock].L2P_Index[Lj] = Pk;
+						//tmp給j, Pj->Lk, A->B
+						assert(Lj == N->SHUFFLE_TL[dataBlock].P2L_Index[Pj]);
+						N->SHUFFLE_TL[dataBlock].P2L_Index[Pj] = Lk;
+						N->SHUFFLE_TL[dataBlock].WriteFreq[Pj] = tmp_WriteFreq;
+						N->SHUFFLE_TL[dataBlock].DirtyUnit[Pj] = tmp_DirtyUnit;
+						assert(Pk == N->SHUFFLE_TL[dataBlock].L2P_Index[Lk]);
+						N->SHUFFLE_TL[dataBlock].L2P_Index[Lk] = Pj;
+					}
+				}
+				if (j == 0){ break; }//j,k是DWORD, 沒有負數
+			}//檢查每一個L都有唯一對應到P,反之亦是
+			const DWORD check_mapping_value = (NC->blockSizeTrack - 1)*NC->blockSizeTrack / 2;
+			DWORD L2P_Index_SUM = 0, P2L_Index_SUM = 0;
+			for (j = 0; j < NC->blockSizeTrack; j++){
+				L2P_Index_SUM += N->SHUFFLE_TL[dataBlock].L2P_Index[j];
+				P2L_Index_SUM += N->SHUFFLE_TL[dataBlock].P2L_Index[j];
+			}assert(L2P_Index_SUM == check_mapping_value); assert(P2L_Index_SUM == check_mapping_value);
+
+			//對應DB的Shuffle資訊只留L2P, P2L. 因為要重新統計所以把freq, dirty清成0
+			for (j = start_Track; j < NC->blockSizeTrack; j++){//0 start_Cylinder
+				//assert(DB_Cylinder[N->SHUFFLE_TL[dataBlock].P2L_Index[j]] == N->SHUFFLE_TL[dataBlock].DirtyUnit[j]);//確認沒有少寫
+				if (DB_Cylinder[N->SHUFFLE_TL[dataBlock].P2L_Index[j]] != N->SHUFFLE_TL[dataBlock].DirtyUnit[j]){
+					printf("%lu, %lu: %lu %lu: %lu\n", dataBlock, N->SHUFFLE_TL[dataBlock].P2L_Index[j], DB_Cylinder[N->SHUFFLE_TL[dataBlock].P2L_Index[j]], j, N->SHUFFLE_TL[dataBlock].DirtyUnit[j]);
+					system("pause");
+				}
+				//在Delay期間留住Shuffle段落的WriteFreq, 防止Delay Cylinder在Delay結束的時候放到太前面
+				if (N->DELAY_SECTORinBAND[dataBlock] == 0){ assert(N->SHUFFLE_BOUND[dataBlock] == 0); N->SHUFFLE_TL[dataBlock].WriteFreq[j] = 0; }
+				N->SHUFFLE_TL[dataBlock].DirtyUnit[j] = 0;
+			}
+#endif
+			//更新統計資料
+			assert(start_Sector <= NC->blockSizeSector);//等於是因為Delay
+			//SLB->pageRead += (NC->blockSizeSector - start_Sector); SLB->pageWrite += (NC->blockSizeSector - start_Sector);
+			validIs1 += (NC->blockSizeSector - start_Sector - merge_ram_size); //assert(NC->blockSizeSector - start_Sector >= validIs0);
+			SLB->merge_count += (NC->blockSizeSector - start_Sector);
+			//紀錄Effect Merge有多少dirty sectors,多少cumu dirty sectors
+			//assert(merge_ram_size == validIs0);//當1 section = 1 sector成立
+			Dirty_Sectors += (I64)merge_ram_size;
+			N->req_w_cumu += Cumu_Dirty_Sectors;
+
+			//歸還DB的sectors記憶體
+			//assert(N->DBalloc[dataBlock] == 1);
+			//free(N->blocks[dataBlock].sections);
+			//N->DBalloc[dataBlock] = 0;
+			//N->blocks[block_no].sections = NULL;//dataBlock
+#ifdef MergeAssoc_SLBpart
+			//N->l2pmapOvd.round_LB_Live_Section -= merge_ram_size;
+			if (N->l2pmapOvd.AA > N->l2pmapOvd.max_AA){ N->l2pmapOvd.max_AA = N->l2pmapOvd.AA; }
+			N->l2pmapOvd.AA_Rate += ((double)N->l2pmapOvd.AA / SLB->SLBsection_num);
+			N->l2pmapOvd.AA -= merge_ram_size;
+			//assert(0 <= N->l2pmapOvd.round_LB_Live_Section);
+			//assert(N->l2pmapOvd.round_LB_Live_Section <= SLB->SLBsection_num);
+			//N->l2pmapOvd.LB_Live_Rate += ((double)N->l2pmapOvd.round_LB_Live_Section / SLB->SLBsection_num);
+			//N->l2pmapOvd.AA_Rate += ((double)N->l2pmapOvd.AA / SLB->SLBsection_num);
+			fprintf(fp_SLB, "%lu (%lu:%lu), %lu\n", dataBlock, validIs0, validIs1, N->l2pmapOvd.AA);//SourceTracks_count, N->l2pmapOvd.round_LB_Live_Section,
+
+#endif
+#ifdef Time_Overhead
+			assert(merge_ram_size >= 0);
+			if (start_Cylinder == NC->blockSizeCylinder){ assert(merge_ram_size == 0); }
+			Merge_R_SeekCount = N->Merge_R_SeekCount;
+			for (j = start_Track; j < NC->blockSizeTrack; j++){//讀DB資料
+				SectorTableNo3 = (I64)dataBlock*NC->blockSizeSector + j*NC->trackSizeSector; assert(0 <= SectorTableNo3 && SectorTableNo3 < NC->LsizePage);
+				//Write_W:0, Write_R:1, Merge_W:2, Merge_R:3
+				test(simPtr, SectorTableNo3, 3);
+				//Calc_RotateOverhead2(simPtr, 0, 3);//把DBtrack舊資料整條讀到merge_ram裡
+				Calc_Rotate_SkewSMR(simPtr, SectorTableNo3, 3);
+				N->content_rotate += NC->trackSizeSector;
+				N->MR_content_rotate += NC->trackSizeSector;
+				N->Req_RunTime += 10;
+				//統計
+				SLB->pageRead += NC->trackSizeSector;
+			}
+			assert(0 <= merge_ram_size); assert(merge_ram_size <= NC->blockSizeSection);
+			qsort(merge_ram, merge_ram_size, sizeof(DWORD), compare);
+			if (merge_ram_size > 1){ for (j = 0; j < merge_ram_size - 1; j++){ assert(merge_ram[j] <= merge_ram[j + 1]); } }
+			//acctime //如果遇到全Band Delay(幾乎不可能), 則merge_ram_size是0, 直接seek和rotate一次造成多算!!
+			test(simPtr, (I64)NC->LsizeSector + merge_ram[0], 4);//3
+			//Calc_RotateOverhead2(simPtr, 0, 4);//read SLB track 3
+			Calc_Rotate_SkewSMR(simPtr, (I64)NC->LsizeSector + merge_ram[0], 4);
+			N->S_CT++;
+			//統計
+			SLB->pageRead += merge_ram_size;
+			//(unsigned long long)ceil((double)merge_ram_size / NC->trackSizeSection)
+			N->content_rotate += merge_ram_size;
+			N->MR_content_rotate += merge_ram_size;
+			N->Merge_LB_Trackcount++;
+			for (j = 1; j < merge_ram_size; j++){//電梯法回SLB讀資料
+				//Write_W:0, Write_R:1, Merge_W:2, Merge_R:3
+				test(simPtr, (I64)NC->LsizeSector + merge_ram[j], 4);//3
+				if (merge_ram[j - 1] / NC->trackSizeSector != merge_ram[j] / NC->trackSizeSector){
+					//Calc_RotateOverhead2(simPtr, 0, 4);
+					Calc_Rotate_SkewSMR(simPtr, (I64)NC->LsizeSector + merge_ram[j], 4);
+					N->S_CT++;
+				}//3
+				N->Merge_LB_Trackcount++;//與S_MRS重複
+			}
+			N->merge_ram_writecount++; //
+			N->S_MRS += (I64)merge_ram_size;
+			//transfer time
+			N->Req_RunTime += (unsigned long long)round((double)merge_ram_size / NC->trackSizeSector * 10);
+			//確認seek次數正確
+			Merge_W_SeekCount = N->Merge_W_SeekCount;
+
+#ifdef POWERFAIL
+			PF_DiskCacheWrite(simPtr, start_Track);
+#endif
+			//combine DB和SLB資料
+			for (j = start_Track; j < NC->blockSizeTrack; j++){//寫入DB
+				SectorTableNo3 = (I64)dataBlock*NC->blockSizeSector + j*NC->trackSizeSector; assert(0 <= SectorTableNo3 && SectorTableNo3 < NC->LsizePage);
+				//Write_W:0, Write_R:1, Merge_W:2, Merge_R:3
+				test(simPtr, (I64)SectorTableNo3, 2);
+				//Calc_RotateOverhead2(simPtr, 0, 2);//write DB track
+				Calc_Rotate_SkewSMR(simPtr, SectorTableNo3, 2);
+				N->content_rotate += NC->trackSizeSector;
+				N->MW_content_rotate += NC->trackSizeSector;
+				N->Req_RunTime += 10;
+				//紀錄Merge寫多少Track
+				N->Merge_Trackcount++;
+				//統計
+				SLB->pageWrite += NC->trackSizeSector;
+			}
+			//assert(N->Merge_W_SeekCount - Merge_W_SeekCount == NC->blockSizeCylinder - start_Cylinder);//Delay Band
+			merge_ram_size = 0;
+#endif
+			assert(0 <= validIs0); assert(validIs0 <= NC->blockSizeSector);
+			N->blocks[Victim].sections[i].valid = 0;
+			//SLB統計PM會merge到那些Cylinder上
+			j = 0; while (DB_Cylinder[j] == 0){ j++; }
+			assert(j < NC->blockSizeTrack); s_DirtyCyl = j;
+			j = NC->blockSizeTrack - 1; while (DB_Cylinder[j] == 0){ j--; }
+			assert(0 <= j); e_DirtyCyl = j; assert(s_DirtyCyl <= e_DirtyCyl);
+			//找到s_DirtyCyl, e_DirtyCyl
+			DWORD CleanRegionMAx = s_DirtyCyl + 1, CleanRegionTmp = 0;//clean region統計
+			DWORD PMG_WriteCost = NC->blockSizeTrack, tmp_PMG_WriteCost = 0;//clean region統計
+			N->PM_NoGuard_Cylinders += (NC->blockSizeTrack - s_DirtyCyl);//PM_NoGuard寫多少
+			N->Range_Cylinders += (e_DirtyCyl + 1 - s_DirtyCyl);//有Dirty Cylinder的Range
+			for (j = s_DirtyCyl; j <= e_DirtyCyl; j++){//統計Clean Region, 找最佳Guard切點
+				if (DB_Cylinder[j] == 0 && j + 1 < NC->blockSizeTrack){
+					assert(DB_Cylinder[j + 1] >= 0);
+					if (DB_Cylinder[j + 1] == 0){ CleanRegionTmp++; }//找Clean Region
+					else{
+						N->CleanRegion_Count++; N->CleanRegion_CumuSize += CleanRegionTmp;
+						if (CleanRegionTmp > CleanRegionMAx){ CleanRegionMAx = CleanRegionTmp; }
+						CleanRegionTmp = 0;//找到,統計完歸0 
+					}
+				}
+				if (DB_Cylinder[j] > 0){//預算PMG最佳多少
+					N->LB_DirtySectors += DB_Cylinder[j];
+					N->DirtyInRange_Cylinders++;
+					if (j + 1 < NC->blockSizeTrack){
+						assert(DB_Cylinder[j + 1] >= 0);
+						if (DB_Cylinder[j + 1] == 0){//算Guard不同地方寫多少, 找寫最少的情況
+							k = j + 1; while (DB_Cylinder[k] == 0){ k++; if (k == NC->blockSizeTrack){ break; } }
+							assert(j + 1 > s_DirtyCyl); assert(NC->blockSizeTrack >= k);
+							tmp_PMG_WriteCost = (j + 1 - s_DirtyCyl) + (NC->blockSizeTrack - k);
+							if (tmp_PMG_WriteCost < PMG_WriteCost){ PMG_WriteCost = tmp_PMG_WriteCost; }
+						}
+					}
+				}
+			}
+			if (e_DirtyCyl < NC->blockSizeTrack - 1){ //clean region統計
+				N->CleanRegion_Count++; N->CleanRegion_CumuSize += (NC->blockSizeTrack - e_DirtyCyl);
+				if ((NC->blockSizeTrack - e_DirtyCyl) > CleanRegionMAx){ CleanRegionMAx = NC->blockSizeTrack - e_DirtyCyl; }
+			}
+			N->CleanRegionMAx_Count++; N->CleanRegionMAx_CumuSize += CleanRegionMAx;
+			N->PMG_WriteCost_Sum += PMG_WriteCost;//紀錄最佳Guard位置需要的寫入量
+		}//一般BandMerge
+		else {
+			NoMerge_Band++; assert(SectorTableNo1 < NC->LsizePage);
+		}
+		//N->blocks[Victim].pages[i].sector = 0x7fffffff;
+		//assert(N->blocks[Victim].sections[i].valid == 0);
+		assert(N->blocks[Victim].sections[i].valid == 0 || N->blocks[Victim].sections[i].valid == 3);
+	}
+
+	if (Merge_Bands > 0){
+		N->ValidIs0 += Dirty_Sectors; N->Cumu_Dirty_Sectors += Cumu_Dirty_Sectors;
+		N->Effect_Merge++;
+	}
+	if (NoMerge_Band == NC->trackSizePage){ N->NoMerge_Band++; }
+#ifdef Simulation_SLB_DELAY
+	//DWORD P_Index = N->SHUFFLE_TL[dataBlock].L2P_Index[j / NC->CylinderSizeSector];
+	//assert((SLB->lastRWsection + NC->CylinderSizeSector) % (SLB->Partial_Section + 1) == SLB->guardTrack1stSection);
+	assert(SLB->lastRWsection == SLB->guardTrack1stSection);
+	for (i = tsp_start; i <= tsp_end; i++){
+		if (N->blocks[NC->PsizeBlock - 1].sections[i].valid == 3){
+			//確認mapping正確
+			SectorTableNo2 = N->blocks[NC->LsizeBlock].sections[i].sector;
+			dataBlock = SectorTableNo2 / NC->blockSizeSector;
+			dataSector = SectorTableNo2 % NC->blockSizeSector;
+			assert(N->blocks[dataBlock].sections[dataSector].sector == i);
+			assert(N->blocks[dataBlock].sections[dataSector].valid == 0);
+			//
+			N->blocks[NC->PsizeBlock - 1].sections[i].valid = 0;
+			N->blocks[dataBlock].sections[dataSector].valid = 1;
+			N->blocks[dataBlock].sections[dataSector].sector = SectorTableNo2;
+			//暫存victim上其他Delay Sector
+			assert(N->VC_BUFF_Len < NC->CylinderSizeSector);
+			N->VictimCylinder_BUFF[N->VC_BUFF_Len] = SectorTableNo2; N->VC_BUFF_Len++;
+		}
+	}
+	assert(N->VC_BUFF_Len <= NC->CylinderSizeSector);
+	for (i = 0; i < N->VC_BUFF_Len; i++){
+		SectorTableNo2 = N->VictimCylinder_BUFF[i];
+		dataBlock = SectorTableNo2 / NC->blockSizeSector;
+		dataSector = SectorTableNo2 % NC->blockSizeSector;
+		assert(N->blocks[dataBlock].sections[dataSector].valid == 1);
+		assert(N->blocks[dataBlock].sections[dataSector].sector == SectorTableNo2);
+		//更新SLB2DB: 寫到SLB裡
+		assert(SLB->lastRWsection >= 0); assert(SLB->lastRWsection <= SLB->Partial_Section);
+		assert(N->blocks[NC->PsizeBlock - 1].sections[SLB->lastRWsection].valid == 0);
+		N->blocks[NC->PsizeBlock - 1].sections[SLB->lastRWsection].sector = SectorTableNo2;
+		N->blocks[NC->PsizeBlock - 1].sections[SLB->lastRWsection].valid = 3;//
+		//更新DB2SLB: Data從Band上sector指到SLB裡的最新sector
+		N->blocks[dataBlock].sections[dataSector].valid = 0;
+		N->blocks[dataBlock].sections[dataSector].sector = SLB->lastRWsection;
+
+#ifdef SLB_Mapping_Cache
+		CacheAccess(simPtr, SectorTableNo2, N->blocks[dataBlock].sections[dataSector].sector, 3);
+#endif
+
+		//換下一個SLB Sector
+		SLB->lastRWsection = (SLB->lastRWsection + 1) % (SLB->Partial_Section + 1);
+	}
+	//總共次數SLB->mergecnt, 統計累積多少寫回
+	N->cumuVC_BUFF_Len += N->VC_BUFF_Len;
+#endif
+	//新增
+	assert(LPB_BUFF_Len <= NC->trackSizeSector);
+	for (i = 0; i < LPB_BUFF_Len; i++){
+		SectorTableNo2 = LPB_BUFF[i];
+		dataBlock = SectorTableNo2 / NC->blockSizeSector;
+		dataSector = SectorTableNo2 % NC->blockSizeSector;
+		assert(N->blocks[dataBlock].sections[dataSector].valid == 1);
+		assert(N->blocks[dataBlock].sections[dataSector].sector == SectorTableNo2);
+		//更新SLB2DB: 寫到SLB裡
+		assert(SLB->lastRWsection >= 0); assert(SLB->lastRWsection <= SLB->Partial_Section);
+		assert(N->blocks[NC->PsizeBlock - 1].sections[SLB->lastRWsection].valid == 0);
+		N->blocks[NC->PsizeBlock - 1].sections[SLB->lastRWsection].sector = SectorTableNo2;
+		N->blocks[NC->PsizeBlock - 1].sections[SLB->lastRWsection].valid = 1;//維持一般Dirty Sector狀態
+		//更新DB2SLB: Data從Band上sector指到SLB裡的最新sector
+		N->blocks[dataBlock].sections[dataSector].valid = 0;
+		N->blocks[dataBlock].sections[dataSector].sector = SLB->lastRWsection;
+
+#ifdef SLB_Mapping_Cache
+		CacheAccess(simPtr, SectorTableNo2, N->blocks[dataBlock].sections[dataSector].sector, 3);
+#endif
+		//換下一個SLB Sector
+		SLB->lastRWsection = (SLB->lastRWsection + 1) % (SLB->Partial_Section + 1);
+	}
+#ifdef Time_Overhead
+	assert(N->VC_BUFF_Len + LPB_BUFF_Len <= NC->trackSizeSector);
+	if (N->VC_BUFF_Len + LPB_BUFF_Len > 0){//新增 //N->VC_BUFF_Len > 0
+		//Write_W:0, Write_R:1, Merge_W:2, Merge_R:3
+		//Delay Sector做Write Back, 成本另外算
+		test(simPtr, (I64)NC->LsizeSector + SLB->firstRWsection*NC->Section, 10);//Read
+		test(simPtr, (I64)NC->LsizeSector + SLB->lastRWsection*NC->Section, 0);//Write
+		for (i = 0; i < N->VC_BUFF_Len + LPB_BUFF_Len; i += NC->trackSizeSector){
+			//Calc_RotateOverhead2(simPtr, 0, 10);//Read
+			Calc_Rotate_SkewSMR(simPtr, (I64)NC->LsizeSector + SLB->firstRWsection*NC->Section + i, 10);//Read
+		}
+		for (i = 0; i < N->VC_BUFF_Len + LPB_BUFF_Len; i += NC->trackSizeSector){
+			//Calc_RotateOverhead2(simPtr, 0, 10);//Write
+			Calc_Rotate_SkewSMR(simPtr, (I64)NC->LsizeSector + SLB->lastRWsection*NC->Section + i, 10);//Write
+		}//把DBtrack舊資料整條讀到merge_ram裡
+		//統計
+		SLB->pageRead += (N->VC_BUFF_Len + LPB_BUFF_Len);
+		SLB->pageWrite += (N->VC_BUFF_Len + LPB_BUFF_Len);
+		//統計content_rotate
+		N->content_rotate += 2 * (N->VC_BUFF_Len + LPB_BUFF_Len);
+		N->WB_content_rotate += (N->VC_BUFF_Len + LPB_BUFF_Len);//Read
+		N->WW_content_rotate += (N->VC_BUFF_Len + LPB_BUFF_Len);//Write
+		//transfer time
+		N->Req_RunTime += 2 * (unsigned long long)round((double)(N->VC_BUFF_Len + LPB_BUFF_Len) / NC->trackSizeSector * 10);
+		assert(N->Req_RunTime >= 0);
+	}
+	//紀錄Delay+LoopBand共有多少寫回
+	N->WB_BUFF_Len = N->VC_BUFF_Len + LPB_BUFF_Len;
+	free(merge_ram);
+#endif
+	//update SMR LB information // 0x3fffffff;
+	/*SLB->firstRWsection = (SLB->firstRWsection + NC->CylinderSizeTrack*NC->trackSizeSection) % (SLB->Partial_Section + 1);
+	SLB->guardTrack1stSection = (SLB->guardTrack1stSection + NC->CylinderSizeTrack*NC->trackSizeSection) % (SLB->Partial_Section + 1);
+	for (i = SLB->guardTrack1stSection; i < SLB->guardTrack1stSection + NC->CylinderSizeTrack*NC->trackSizeSection; i++){
+	N->blocks[NC->PsizeBlock - 1].sections[i].sector = 0xffffffffffff;
+	assert(N->blocks[NC->PsizeBlock - 1].sections[i].valid == 0);
+	}
+	SLB->writedSectionNum -= (NC->CylinderSizeTrack*NC->trackSizeSection);*/
+	//修改
+	SLB->firstRWsection = (SLB->firstRWsection + NC->trackSizeSection) % (SLB->Partial_Section + 1);
+	SLB->guardTrack1stSection = (SLB->guardTrack1stSection + NC->trackSizeSection) % (SLB->Partial_Section + 1);
+	//for (i = SLB->guardTrack1stSection; i < SLB->guardTrack1stSection + NC->CylinderSizeTrack*NC->trackSizeSection; i++){
+	//	N->blocks[NC->PsizeBlock - 1].sections[i].sector = 0xffffffffffff;// 0x3fffffff;
+	//	assert(N->blocks[NC->PsizeBlock - 1].sections[i].valid == 0);
+	//}
+	DWORD tmpSC = SLB->guardTrack1stSection;
+	for (i = 0; i < NC->CylinderSizeTrack; i++){
+		assert(tmpSC % NC->trackSizeSector == 0);
+		for (j = tmpSC; j < tmpSC + NC->trackSizeSector; j++){
+			N->blocks[NC->PsizeBlock - 1].sections[j].sector = 0xffffffffffff;
+			assert(N->blocks[NC->PsizeBlock - 1].sections[j].valid == 0);
+		}
+		tmpSC += NC->trackSizeSector; if (tmpSC > SLB->Partial_Section){ assert(tmpSC == SLB->Partial_Section + 1); tmpSC = 0; }
+	}
+
+	SLB->writedSectionNum -= NC->trackSizeSection;
+
+	//SLB統計PM會merge到那些Cylinder上
+	free(DB_Cylinder);
+	//Track Unit轉成Cylinder Unit
+	free(Cylinder_DirtyUnit);
+	//新增
+	free(LPB_BUFF);
+}
